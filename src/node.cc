@@ -161,6 +161,7 @@ static bool throw_deprecation = false;
 static bool trace_sync_io = false;
 static bool track_heap_objects = false;
 static const char* eval_string = nullptr;
+static bool expose_internals = false;
 static unsigned int preload_module_count = 0;
 static const char** preload_modules = nullptr;
 static const int v8_default_thread_pool_size = 4;
@@ -3337,6 +3338,11 @@ void SetupProcessObject(Environment* env,
     READONLY_PROPERTY(process, "_debugWaitConnect", True(env->isolate()));
   }
 
+  // --expose_internals,--expose-internals
+  if (expose_internals) {
+    READONLY_PROPERTY(process, "_exposeInternals", True(env->isolate()));
+  }
+
   // --security-revert flags
 #define V(code, _, __)                                                        \
   do {                                                                        \
@@ -3792,7 +3798,7 @@ static void ParseArgs(int* argc,
 #endif
     } else if (strcmp(arg, "--expose-internals") == 0 ||
                strcmp(arg, "--expose_internals") == 0) {
-      // consumed in js
+      expose_internals = true;
     } else if (strcmp(arg, "--") == 0) {
       index += 1;
       break;

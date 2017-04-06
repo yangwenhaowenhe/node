@@ -3339,6 +3339,8 @@ void SetupProcessObject(Environment* env,
   }
 
   // --expose_internals, --expose-internals
+  // Note that this is not exposed as a process property, it is deleted when
+  // node's javascript bootstrap code runs.
   if (expose_internals) {
     READONLY_PROPERTY(process, "_exposeInternals", True(env->isolate()));
   }

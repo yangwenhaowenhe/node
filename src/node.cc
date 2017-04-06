@@ -3338,7 +3338,7 @@ void SetupProcessObject(Environment* env,
     READONLY_PROPERTY(process, "_debugWaitConnect", True(env->isolate()));
   }
 
-  // --expose_internals,--expose-internals
+  // --expose_internals, --expose-internals
   if (expose_internals) {
     READONLY_PROPERTY(process, "_exposeInternals", True(env->isolate()));
   }

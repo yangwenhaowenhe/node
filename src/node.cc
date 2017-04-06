@@ -3280,7 +3280,7 @@ void SetupProcessObject(Environment* env,
     READONLY_PROPERTY(process, "_forceRepl", True(env->isolate()));
   }
 
-  // -r,--require
+  // -r, --require
   if (preload_module_count) {
     CHECK(preload_modules);
     Local<Array> array = Array::New(env->isolate());

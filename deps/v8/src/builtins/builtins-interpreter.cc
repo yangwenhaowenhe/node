@@ -2,24 +2,30 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "src/builtins/builtins.h"
 #include "src/builtins/builtins-utils.h"
+#include "src/builtins/builtins.h"
+#include "src/globals.h"
+#include "src/handles-inl.h"
+#include "src/objects-inl.h"
 
 namespace v8 {
 namespace internal {
 
-Handle<Code> Builtins::InterpreterPushArgsAndCall(TailCallMode tail_call_mode,
-                                                  CallableType function_type) {
-  switch (tail_call_mode) {
-    case TailCallMode::kDisallow:
-      if (function_type == CallableType::kJSFunction) {
+Handle<Code> Builtins::InterpreterPushArgsAndCall(
+    TailCallMode tail_call_mode, InterpreterPushArgsMode mode) {
+  switch (mode) {
+    case InterpreterPushArgsMode::kJSFunction:
+      if (tail_call_mode == TailCallMode::kDisallow) {
         return InterpreterPushArgsAndCallFunction();
       } else {
-        return InterpreterPushArgsAndCall();
-      }
-    case TailCallMode::kAllow:
-      if (function_type == CallableType::kJSFunction) {
         return InterpreterPushArgsAndTailCallFunction();
+      }
+    case InterpreterPushArgsMode::kWithFinalSpread:
+      CHECK(tail_call_mode == TailCallMode::kDisallow);
+      return InterpreterPushArgsAndCallWithFinalSpread();
+    case InterpreterPushArgsMode::kOther:
+      if (tail_call_mode == TailCallMode::kDisallow) {
+        return InterpreterPushArgsAndCall();
       } else {
         return InterpreterPushArgsAndTailCall();
       }
@@ -28,48 +34,18 @@ Handle<Code> Builtins::InterpreterPushArgsAndCall(TailCallMode tail_call_mode,
   return Handle<Code>::null();
 }
 
-void Builtins::Generate_InterpreterPushArgsAndCall(MacroAssembler* masm) {
-  return Generate_InterpreterPushArgsAndCallImpl(masm, TailCallMode::kDisallow,
-                                                 CallableType::kAny);
-}
-
-void Builtins::Generate_InterpreterPushArgsAndCallFunction(
-    MacroAssembler* masm) {
-  return Generate_InterpreterPushArgsAndCallImpl(masm, TailCallMode::kDisallow,
-                                                 CallableType::kJSFunction);
-}
-
-void Builtins::Generate_InterpreterPushArgsAndTailCall(MacroAssembler* masm) {
-  return Generate_InterpreterPushArgsAndCallImpl(masm, TailCallMode::kAllow,
-                                                 CallableType::kAny);
-}
-
-void Builtins::Generate_InterpreterPushArgsAndTailCallFunction(
-    MacroAssembler* masm) {
-  return Generate_InterpreterPushArgsAndCallImpl(masm, TailCallMode::kAllow,
-                                                 CallableType::kJSFunction);
-}
-
 Handle<Code> Builtins::InterpreterPushArgsAndConstruct(
-    CallableType function_type) {
-  switch (function_type) {
-    case CallableType::kJSFunction:
+    InterpreterPushArgsMode mode) {
+  switch (mode) {
+    case InterpreterPushArgsMode::kJSFunction:
       return InterpreterPushArgsAndConstructFunction();
-    case CallableType::kAny:
+    case InterpreterPushArgsMode::kWithFinalSpread:
+      return InterpreterPushArgsAndConstructWithFinalSpread();
+    case InterpreterPushArgsMode::kOther:
       return InterpreterPushArgsAndConstruct();
   }
   UNREACHABLE();
   return Handle<Code>::null();
-}
-
-void Builtins::Generate_InterpreterPushArgsAndConstruct(MacroAssembler* masm) {
-  return Generate_InterpreterPushArgsAndConstructImpl(masm, CallableType::kAny);
-}
-
-void Builtins::Generate_InterpreterPushArgsAndConstructFunction(
-    MacroAssembler* masm) {
-  return Generate_InterpreterPushArgsAndConstructImpl(
-      masm, CallableType::kJSFunction);
 }
 
 }  // namespace internal

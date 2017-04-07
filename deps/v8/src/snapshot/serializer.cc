@@ -4,6 +4,9 @@
 
 #include "src/snapshot/serializer.h"
 
+#include "src/assembler-inl.h"
+#include "src/deoptimizer.h"
+#include "src/heap/heap-inl.h"
 #include "src/macro-assembler.h"
 #include "src/snapshot/natives.h"
 
@@ -332,6 +335,25 @@ bool Serializer::HasNotExceededFirstPageOfEachSpace() {
   return true;
 }
 
+bool Serializer::ObjectSerializer::TryEncodeDeoptimizationEntry(
+    HowToCode how_to_code, Address target, int skip) {
+  for (int bailout_type = 0; bailout_type <= Deoptimizer::kLastBailoutType;
+       ++bailout_type) {
+    int id = Deoptimizer::GetDeoptimizationId(
+        serializer_->isolate(), target,
+        static_cast<Deoptimizer::BailoutType>(bailout_type));
+    if (id == Deoptimizer::kNotDeoptimizationEntry) continue;
+    sink_->Put(how_to_code == kPlain ? kDeoptimizerEntryPlain
+                                     : kDeoptimizerEntryFromCode,
+               "DeoptimizationEntry");
+    sink_->PutInt(skip, "SkipB4DeoptimizationEntry");
+    sink_->Put(bailout_type, "BailoutType");
+    sink_->PutInt(id, "EntryId");
+    return true;
+  }
+  return false;
+}
+
 void Serializer::ObjectSerializer::SerializePrologue(AllocationSpace space,
                                                      int size, Map* map) {
   if (serializer_->code_address_map_) {
@@ -379,6 +401,69 @@ void Serializer::ObjectSerializer::SerializePrologue(AllocationSpace space,
 }
 
 void Serializer::ObjectSerializer::SerializeExternalString() {
+  Heap* heap = serializer_->isolate()->heap();
+  if (object_->map() != heap->native_source_string_map()) {
+    // Usually we cannot recreate resources for external strings. To work
+    // around this, external strings are serialized to look like ordinary
+    // sequential strings.
+    // The exception are native source code strings, since we can recreate
+    // their resources.
+    SerializeExternalStringAsSequentialString();
+  } else {
+    DCHECK(object_->IsExternalOneByteString());
+    DCHECK(ExternalOneByteString::cast(object_)->is_short());
+    int size = object_->Size();
+    Map* map = object_->map();
+    AllocationSpace space =
+        MemoryChunk::FromAddress(object_->address())->owner()->identity();
+    SerializePrologue(space, size, map);
+    // Serialize the rest of the object.
+    CHECK_EQ(0, bytes_processed_so_far_);
+    bytes_processed_so_far_ = kPointerSize;
+    typedef v8::String::ExternalOneByteStringResource Resource;
+    Resource** resource_pointer = reinterpret_cast<Resource**>(
+        HeapObject::RawField(object_, ExternalString::kResourceOffset));
+
+    Address references_start = reinterpret_cast<Address>(resource_pointer);
+    OutputRawData(references_start);
+    if (!SerializeExternalNativeSourceString(
+            Natives::GetBuiltinsCount(), resource_pointer,
+            Natives::GetSourceCache(heap), kNativesStringResource)) {
+      bool result = SerializeExternalNativeSourceString(
+          ExtraNatives::GetBuiltinsCount(), resource_pointer,
+          ExtraNatives::GetSourceCache(heap), kExtraNativesStringResource);
+      // One of the strings in the natives cache should match the resource.  We
+      // don't expect any other kinds of external strings here.
+      USE(result);
+      DCHECK(result);
+    }
+    OutputRawData(object_->address() + size);
+  }
+}
+
+bool Serializer::ObjectSerializer::SerializeExternalNativeSourceString(
+    int builtin_count,
+    v8::String::ExternalOneByteStringResource** resource_pointer,
+    FixedArray* source_cache, int resource_index) {
+  Isolate* isolate = serializer_->isolate();
+  for (int i = 0; i < builtin_count; i++) {
+    Object* source = source_cache->get(i);
+    if (!source->IsUndefined(isolate)) {
+      ExternalOneByteString* string = ExternalOneByteString::cast(source);
+      typedef v8::String::ExternalOneByteStringResource Resource;
+      const Resource* resource = string->resource();
+      if (resource == *resource_pointer) {
+        sink_->Put(resource_index, "NativesStringResource");
+        sink_->PutSection(i, "NativesStringResourceEnd");
+        bytes_processed_so_far_ += sizeof(resource);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void Serializer::ObjectSerializer::SerializeExternalStringAsSequentialString() {
   // Instead of serializing this as an external string, we serialize
   // an imaginary sequential string with the same content.
   Isolate* isolate = serializer_->isolate();
@@ -479,55 +564,45 @@ void Serializer::ObjectSerializer::Serialize() {
     PrintF("\n");
   }
 
-  // We cannot serialize typed array objects correctly.
-  DCHECK(!object_->IsJSTypedArray());
-
-  // We don't expect fillers.
-  DCHECK(!object_->IsFiller());
-
-  if (object_->IsScript()) {
-    // Clear cached line ends.
-    Object* undefined = serializer_->isolate()->heap()->undefined_value();
-    Script::cast(object_)->set_line_ends(undefined);
-  }
-
   if (object_->IsExternalString()) {
-    Heap* heap = serializer_->isolate()->heap();
-    if (object_->map() != heap->native_source_string_map()) {
-      // Usually we cannot recreate resources for external strings. To work
-      // around this, external strings are serialized to look like ordinary
-      // sequential strings.
-      // The exception are native source code strings, since we can recreate
-      // their resources. In that case we fall through and leave it to
-      // VisitExternalOneByteString further down.
-      SerializeExternalString();
+    SerializeExternalString();
+  } else {
+    // We cannot serialize typed array objects correctly.
+    DCHECK(!object_->IsJSTypedArray());
+
+    // We don't expect fillers.
+    DCHECK(!object_->IsFiller());
+
+    if (object_->IsScript()) {
+      // Clear cached line ends.
+      Object* undefined = serializer_->isolate()->heap()->undefined_value();
+      Script::cast(object_)->set_line_ends(undefined);
+    }
+
+    int size = object_->Size();
+    Map* map = object_->map();
+    AllocationSpace space =
+        MemoryChunk::FromAddress(object_->address())->owner()->identity();
+    SerializePrologue(space, size, map);
+
+    // Serialize the rest of the object.
+    CHECK_EQ(0, bytes_processed_so_far_);
+    bytes_processed_so_far_ = kPointerSize;
+
+    RecursionScope recursion(serializer_);
+    // Objects that are immediately post processed during deserialization
+    // cannot be deferred, since post processing requires the object content.
+    if (recursion.ExceedsMaximum() && CanBeDeferred(object_)) {
+      serializer_->QueueDeferredObject(object_);
+      sink_->Put(kDeferred, "Deferring object content");
       return;
     }
+
+    UnlinkWeakNextScope unlink_weak_next(object_);
+
+    object_->IterateBody(map->instance_type(), size, this);
+    OutputRawData(object_->address() + size);
   }
-
-  int size = object_->Size();
-  Map* map = object_->map();
-  AllocationSpace space =
-      MemoryChunk::FromAddress(object_->address())->owner()->identity();
-  SerializePrologue(space, size, map);
-
-  // Serialize the rest of the object.
-  CHECK_EQ(0, bytes_processed_so_far_);
-  bytes_processed_so_far_ = kPointerSize;
-
-  RecursionScope recursion(serializer_);
-  // Objects that are immediately post processed during deserialization
-  // cannot be deferred, since post processing requires the object content.
-  if (recursion.ExceedsMaximum() && CanBeDeferred(object_)) {
-    serializer_->QueueDeferredObject(object_);
-    sink_->Put(kDeferred, "Deferring object content");
-    return;
-  }
-
-  UnlinkWeakNextScope unlink_weak_next(object_);
-
-  object_->IterateBody(map->instance_type(), size, this);
-  OutputRawData(object_->address() + size);
 }
 
 void Serializer::ObjectSerializer::SerializeDeferred() {
@@ -609,10 +684,12 @@ void Serializer::ObjectSerializer::VisitEmbeddedPointer(RelocInfo* rinfo) {
 void Serializer::ObjectSerializer::VisitExternalReference(Address* p) {
   int skip = OutputRawData(reinterpret_cast<Address>(p),
                            kCanReturnSkipInsteadOfSkipping);
-  sink_->Put(kExternalReference + kPlain + kStartOfObject, "ExternalRef");
-  sink_->PutInt(skip, "SkipB4ExternalRef");
   Address target = *p;
-  sink_->PutInt(serializer_->EncodeExternalReference(target), "reference id");
+  if (!TryEncodeDeoptimizationEntry(kPlain, target, skip)) {
+    sink_->Put(kExternalReference + kPlain + kStartOfObject, "ExternalRef");
+    sink_->PutInt(skip, "SkipB4ExternalRef");
+    sink_->PutInt(serializer_->EncodeExternalReference(target), "reference id");
+  }
   bytes_processed_so_far_ += kPointerSize;
 }
 
@@ -620,11 +697,14 @@ void Serializer::ObjectSerializer::VisitExternalReference(RelocInfo* rinfo) {
   int skip = OutputRawData(rinfo->target_address_address(),
                            kCanReturnSkipInsteadOfSkipping);
   HowToCode how_to_code = rinfo->IsCodedSpecially() ? kFromCode : kPlain;
-  sink_->Put(kExternalReference + how_to_code + kStartOfObject, "ExternalRef");
-  sink_->PutInt(skip, "SkipB4ExternalRef");
   Address target = rinfo->target_external_reference();
-  DCHECK_NOT_NULL(target);  // Code does not reference null.
-  sink_->PutInt(serializer_->EncodeExternalReference(target), "reference id");
+  if (!TryEncodeDeoptimizationEntry(how_to_code, target, skip)) {
+    sink_->Put(kExternalReference + how_to_code + kStartOfObject,
+               "ExternalRef");
+    sink_->PutInt(skip, "SkipB4ExternalRef");
+    DCHECK_NOT_NULL(target);  // Code does not reference null.
+    sink_->PutInt(serializer_->EncodeExternalReference(target), "reference id");
+  }
   bytes_processed_so_far_ += rinfo->target_address_size();
 }
 
@@ -656,10 +736,13 @@ void Serializer::ObjectSerializer::VisitRuntimeEntry(RelocInfo* rinfo) {
   int skip = OutputRawData(rinfo->target_address_address(),
                            kCanReturnSkipInsteadOfSkipping);
   HowToCode how_to_code = rinfo->IsCodedSpecially() ? kFromCode : kPlain;
-  sink_->Put(kExternalReference + how_to_code + kStartOfObject, "ExternalRef");
-  sink_->PutInt(skip, "SkipB4ExternalRef");
   Address target = rinfo->target_address();
-  sink_->PutInt(serializer_->EncodeExternalReference(target), "reference id");
+  if (!TryEncodeDeoptimizationEntry(how_to_code, target, skip)) {
+    sink_->Put(kExternalReference + how_to_code + kStartOfObject,
+               "ExternalRef");
+    sink_->PutInt(skip, "SkipB4ExternalRef");
+    sink_->PutInt(serializer_->EncodeExternalReference(target), "reference id");
+  }
   bytes_processed_so_far_ += rinfo->target_address_size();
 }
 
@@ -685,52 +768,6 @@ void Serializer::ObjectSerializer::VisitCell(RelocInfo* rinfo) {
   bytes_processed_so_far_ += kPointerSize;
 }
 
-bool Serializer::ObjectSerializer::SerializeExternalNativeSourceString(
-    int builtin_count,
-    v8::String::ExternalOneByteStringResource** resource_pointer,
-    FixedArray* source_cache, int resource_index) {
-  Isolate* isolate = serializer_->isolate();
-  for (int i = 0; i < builtin_count; i++) {
-    Object* source = source_cache->get(i);
-    if (!source->IsUndefined(isolate)) {
-      ExternalOneByteString* string = ExternalOneByteString::cast(source);
-      typedef v8::String::ExternalOneByteStringResource Resource;
-      const Resource* resource = string->resource();
-      if (resource == *resource_pointer) {
-        sink_->Put(resource_index, "NativesStringResource");
-        sink_->PutSection(i, "NativesStringResourceEnd");
-        bytes_processed_so_far_ += sizeof(resource);
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-void Serializer::ObjectSerializer::VisitExternalOneByteString(
-    v8::String::ExternalOneByteStringResource** resource_pointer) {
-  DCHECK_EQ(serializer_->isolate()->heap()->native_source_string_map(),
-            object_->map());
-  DCHECK(ExternalOneByteString::cast(object_)->is_short());
-  Address references_start = reinterpret_cast<Address>(resource_pointer);
-  OutputRawData(references_start);
-  if (SerializeExternalNativeSourceString(
-          Natives::GetBuiltinsCount(), resource_pointer,
-          Natives::GetSourceCache(serializer_->isolate()->heap()),
-          kNativesStringResource)) {
-    return;
-  }
-  if (SerializeExternalNativeSourceString(
-          ExtraNatives::GetBuiltinsCount(), resource_pointer,
-          ExtraNatives::GetSourceCache(serializer_->isolate()->heap()),
-          kExtraNativesStringResource)) {
-    return;
-  }
-  // One of the strings in the natives cache should match the resource.  We
-  // don't expect any other kinds of external strings here.
-  UNREACHABLE();
-}
-
 Address Serializer::ObjectSerializer::PrepareCode() {
   Code* code = Code::cast(object_);
   if (FLAG_predictable) {
@@ -745,7 +782,7 @@ Address Serializer::ObjectSerializer::PrepareCode() {
                     RelocInfo::ModeMask(RelocInfo::INTERNAL_REFERENCE_ENCODED);
     for (RelocIterator it(code, mode_mask); !it.done(); it.next()) {
       RelocInfo* rinfo = it.rinfo();
-      rinfo->WipeOut();
+      rinfo->WipeOut(serializer_->isolate());
     }
     // We need to wipe out the header fields *after* wiping out the
     // relocations, because some of these fields are needed for the latter.
